@@ -1,107 +1,275 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <iostream>
+#include <vector>
+#include <string>
+
 using namespace std;
+
 class TimerPatcher {
+private:
     HANDLE processHandle;
     DWORD processId;
     LPVOID currentTimerAddress;
+
 public:
     TimerPatcher() : processHandle(nullptr), processId(0), currentTimerAddress(nullptr) {}
+
     bool findGame() {
-        PROCESSENTRY32 entry = {sizeof(PROCESSENTRY32)};
+        PROCESSENTRY32 entry;
+        entry.dwSize = sizeof(PROCESSENTRY32);
+
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
-        if (snapshot == INVALID_HANDLE_VALUE) return false;
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
         bool found = false;
+
         if (Process32First(snapshot, &entry)) {
             do {
-                if (strstr(entry.szExeFile, "60Seconds")) {
+                if (strcmp(entry.szExeFile, "60Seconds.exe") == 0 ||
+                    strcmp(entry.szExeFile, "60SecondsReatomized.exe") == 0 ||
+                    strcmp(entry.szExeFile, "60 Seconds! Reatomized.exe") == 0) {
+
                     processId = entry.th32ProcessID;
-                    if (processHandle) CloseHandle(processHandle);
+
+                    if (processHandle) {
+                        CloseHandle(processHandle);
+                    }
+
                     processHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
-                    if (processHandle) { found = true; break; }
+
+                    if (processHandle != nullptr) {
+                        found = true;
+                        break;
+                    }
                 }
             } while (Process32Next(snapshot, &entry));
         }
+
         CloseHandle(snapshot);
         return found;
     }
-    LPVOID getModuleBase(const char* name) {
-        MODULEENTRY32 entry = {sizeof(MODULEENTRY32)};
+
+    LPVOID getModuleBaseAddress(const char* moduleName) {
+        MODULEENTRY32 entry;
+        entry.dwSize = sizeof(MODULEENTRY32);
+
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, processId);
-        if (snapshot == INVALID_HANDLE_VALUE) return nullptr;
-        LPVOID base = nullptr;
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return nullptr;
+        }
+
+        LPVOID baseAddress = nullptr;
         if (Module32First(snapshot, &entry)) {
-            do { if (!strcmp(entry.szModule, name)) { base = entry.modBaseAddr; break; }
+            do {
+                if (strcmp(entry.szModule, moduleName) == 0) {
+                    baseAddress = entry.modBaseAddr;
+                    break;
+                }
             } while (Module32Next(snapshot, &entry));
         }
+
         CloseHandle(snapshot);
-        return base;
+        return baseAddress;
     }
-    LPVOID followChain(DWORD offset) {
-        LPVOID base = getModuleBase("mono-2.0-bdwgc.dll");
-        if (!base) return nullptr;
-        uintptr_t addr1, addr2;
-        SIZE_T read;
-        if (!ReadProcessMemory(processHandle, (LPVOID)((uintptr_t)base + offset), &addr1, sizeof(uintptr_t), &read)) return nullptr;
-        if (!ReadProcessMemory(processHandle, (LPVOID)(addr1 + 0x28), &addr2, sizeof(uintptr_t), &read)) return nullptr;
-        return (LPVOID)(addr2 + 0x88);
-    }
-    LPVOID findTimer() {
-        for (DWORD offset : {0x498DE0, 0x4A0C80}) {
-            LPVOID timer = followChain(offset);
-            if (timer) {
-                DWORD val; SIZE_T read;
-                if (ReadProcessMemory(processHandle, timer, &val, sizeof(DWORD), &read) && val >= 30 && val <= 62) return timer;
-            }
+
+    LPVOID followPointerChain(DWORD baseOffset) {
+        LPVOID baseAddress = getModuleBaseAddress("mono-2.0-bdwgc.dll");
+        if (baseAddress == nullptr) {
+            return nullptr;
         }
+
+        uintptr_t baseAddr = reinterpret_cast<uintptr_t>(baseAddress);
+        LPVOID firstAddress = reinterpret_cast<LPVOID>(baseAddr + baseOffset);
+
+        uintptr_t firstValue;
+        SIZE_T bytesRead;
+        if (!ReadProcessMemory(processHandle, firstAddress, &firstValue, sizeof(uintptr_t), &bytesRead)) {
+            return nullptr;
+        }
+
+        LPVOID secondAddress = reinterpret_cast<LPVOID>(firstValue + 0x28);
+
+        uintptr_t secondValue;
+        if (!ReadProcessMemory(processHandle, secondAddress, &secondValue, sizeof(uintptr_t), &bytesRead)) {
+            return nullptr;
+        }
+
+        LPVOID timerAddress = reinterpret_cast<LPVOID>(secondValue + 0x88);
+        return timerAddress;
+    }
+
+    LPVOID findWorkingTimer() {
+        LPVOID timer1 = followPointerChain(0x498DE0);
+        if (timer1 && testTimerAddress(timer1)) {
+            return timer1;
+        }
+
+        LPVOID timer2 = followPointerChain(0x4A0C80);
+        if (timer2 && testTimerAddress(timer2)) {
+            return timer2;
+        }
+
         return nullptr;
     }
-    void run() {
-        HWND console = GetConsoleWindow(); RECT r; GetWindowRect(console, &r);
-        MoveWindow(console, r.left, r.top, (r.right - r.left) / 2, r.bottom - r.top, TRUE);
-        cout << "60 Seconds Timer Patcher v1.0\n==============================\nMonitoring...\n\n";
 
-        int patches = 0, fails = 0, stable = 0;
-        bool found = false, waiting = false, patched = false;
-        DWORD last = 0;
+    bool testTimerAddress(LPVOID address) {
+        DWORD value;
+        SIZE_T bytesRead;
+
+        if (!ReadProcessMemory(processHandle, address, &value, sizeof(DWORD), &bytesRead)) {
+            return false;
+        }
+
+        return (value >= 30 && value <= 62);
+    }
+
+    bool isValidTimerValue(DWORD value) {
+        return (value >= 30 && value <= 62);
+    }
+
+    bool isRoundReset(DWORD currentValue, DWORD lastValue) {
+        if ((lastValue < 40 && currentValue >= 55) ||
+            (abs((int)currentValue - (int)lastValue) > 20 && currentValue > 50)) {
+            return true;
+        }
+        return false;
+    }
+
+    void backgroundMonitor() {
+        cout << "60 Seconds Background Timer Patcher v3.0" << endl;
+        cout << "========================================" << endl;
+        cout << "Monitoring for 60 Seconds! Reatomized..." << endl;
+        cout << "Will patch scav timer to 3 seconds when it reaches 58." << endl;
+        cout << "Simply close this window to end the patch." << endl << endl;
+
+        int patchCount = 0;
+        bool gameWasFound = false;
+        int invalidValueCount = 0;
+        bool waitingForTrigger = false;
+        DWORD lastValue = 0;
+        int stableValueCount = 0;
+        bool timerHasBeenPatched = false;
+        int scanFailCount = 0;
 
         while (true) {
+            // Check for game
             if (!findGame()) {
-                if (found) { cout << "Game closed.\n"; found = false; }
-                currentTimerAddress = nullptr; waiting = patched = false; fails = 0;
-                Sleep(5000); continue;
+                if (gameWasFound) {
+                    cout << "Game closed. Waiting for restart..." << endl;
+                    gameWasFound = false;
+                }
+                currentTimerAddress = nullptr;
+                waitingForTrigger = false;
+                timerHasBeenPatched = false;
+                scanFailCount = 0;
+                Sleep(5000);
+                continue;
+            } else {
+                if (!gameWasFound) {
+                    cout << "60 Seconds! Reatomized detected!" << endl;
+                    gameWasFound = true;
+                    currentTimerAddress = nullptr;
+                    invalidValueCount = 0;
+                    waitingForTrigger = false;
+                    timerHasBeenPatched = false;
+                    scanFailCount = 0;
+                }
             }
-            if (!found) { cout << "Game detected!\n"; found = true; fails = 0; waiting = patched = false; }
 
-            if (!currentTimerAddress) {
-                currentTimerAddress = findTimer();
+            // Try to find timer if we don't have one
+            if (!currentTimerAddress || invalidValueCount > 10) {
+                currentTimerAddress = findWorkingTimer();
+                invalidValueCount = 0;
+                waitingForTrigger = false;
+                timerHasBeenPatched = false;
+
                 if (!currentTimerAddress) {
-                    if (++fails % 10 == 1) cout << "Waiting for timer...\n";
-                    Sleep(3000); continue;
-                }
-                if (fails) { cout << "Timer found!\n"; fails = 0; }
-            }
-            DWORD val; SIZE_T read;
-            if (ReadProcessMemory(processHandle, currentTimerAddress, &val, sizeof(DWORD), &read) && val >= 30 && val <= 62) {
-                if ((last < 40 && val >= 55) || (abs((int)val - (int)last) > 20 && val > 50)) {
-                    cout << "New round!\n"; waiting = patched = false; stable = 0;
-                }
-                stable = (val == last) ? stable + 1 : 0;
-                if (val != last && !stable && val >= 59 && !patched && !waiting) {
-                    cout << "Timer at " << val << " - waiting for 58...\n"; waiting = true;
-                }
-                if (val == 58 && waiting && !patched && stable >= 2) {
-                    DWORD newVal = 3; SIZE_T written;
-                    if (WriteProcessMemory(processHandle, currentTimerAddress, &newVal, sizeof(DWORD), &written)) {
-                        cout << "PATCHED! 58 -> 3 seconds (#" << ++patches << ")\n";
-                        waiting = false; patched = true;
+                    scanFailCount++;
+                    // Only show message every 10 failed scans to reduce spam
+                    if (scanFailCount % 10 == 1) {
+                        cout << "Waiting for active timer..." << endl;
+                    }
+                    Sleep(3000);
+                    continue;
+                } else {
+                    if (scanFailCount > 0) {
+                        cout << "Timer found! Monitoring active." << endl;
+                        scanFailCount = 0;
                     }
                 }
-                last = val;
-            } else currentTimerAddress = nullptr;
+            }
+
+            // Check and patch timer if we have one
+            if (currentTimerAddress) {
+                DWORD currentValue;
+                SIZE_T bytesRead;
+
+                if (ReadProcessMemory(processHandle, currentTimerAddress, &currentValue, sizeof(DWORD), &bytesRead)) {
+
+                    if (isValidTimerValue(currentValue)) {
+                        invalidValueCount = 0;
+
+                        // Check for round reset
+                        if (isRoundReset(currentValue, lastValue)) {
+                            cout << "New round started!" << endl;
+                            waitingForTrigger = false;
+                            timerHasBeenPatched = false;
+                            stableValueCount = 0;
+                        }
+
+                        // Count stable values
+                        if (currentValue == lastValue) {
+                            stableValueCount++;
+                        } else {
+                            stableValueCount = 0;
+                        }
+
+                        // Show important timer changes only
+                        if (currentValue != lastValue && stableValueCount == 0) {
+                            // Only show when waiting for trigger or when timer gets patched
+                            if (currentValue >= 59 && !timerHasBeenPatched) {
+                                if (!waitingForTrigger) {
+                                    cout << "Timer at " << currentValue << " - waiting for 58..." << endl;
+                                    waitingForTrigger = true;
+                                }
+                            }
+                        }
+
+                        // Patch when timer hits exactly 58 seconds
+                        if (currentValue == 58 && waitingForTrigger && !timerHasBeenPatched && stableValueCount >= 2) {
+                            DWORD newValue = 3;
+                            SIZE_T bytesWritten;
+
+                            if (WriteProcessMemory(processHandle, currentTimerAddress, &newValue, sizeof(DWORD), &bytesWritten)) {
+                                patchCount++;
+                                cout << "PATCHED! Timer: 58 -> 3 seconds (#" << patchCount << ")" << endl;
+                                waitingForTrigger = false;
+                                timerHasBeenPatched = true;
+                            }
+                        }
+
+                        lastValue = currentValue;
+                    } else {
+                        invalidValueCount++;
+                        if (invalidValueCount > 10) {
+                            currentTimerAddress = nullptr;
+                        }
+                    }
+                } else {
+                    currentTimerAddress = nullptr;
+                }
+            }
+
             Sleep(200);
         }
     }
 };
-int main() { TimerPatcher().run(); return 0; }
+
+int main() {
+    TimerPatcher patcher;
+    patcher.backgroundMonitor();
+    return 0;
+}
